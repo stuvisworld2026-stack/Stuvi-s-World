@@ -972,8 +972,11 @@ body.bg-image-active{background:transparent!important}
       <div class="panel"><h3>⚙️ Admin Tools</h3><div class="admin-grid">
         <div class="admin-card"><b>💾 Backup</b><p>Download a backup of the current website data.</p><button class="save" onclick="exportAdminData()">Export Backup</button></div>
         <div class="admin-card"><b>📥 Restore</b><p>Restore a previously exported Stuvi backup.</p><input class="input" type="file" id="importAdminFile" accept="application/json"><button class="save" onclick="importAdminData()">Import Backup</button></div>
-        <div class="admin-card"><b>🧹 Reset</b><p>Reset all stored website data on this browser.</p><button class="save" style="background:#c43a68" onclick="resetAllData()">Reset Website Data</button></div>
-        <div class="admin-card"><b>🔐 Session</b><p>Parent access automatically locks when this page is refreshed.</p><button class="save" onclick="adminLogout()">Lock Now</button></div>
+        <div class="admin-card"><b>🧹 Reset</b><p>Reset all stored website data on this browser, including photos and video.</p><button class="save" style="background:#c43a68" onclick="resetAllData()">Reset Website Data</button></div>
+        <div class="admin-card"><b>🔐 Session</b><p>Parent access stays unlocked while this browser tab is open, and locks when the browser is closed. Use Lock Now to lock it immediately.</p><button class="save" onclick="adminLogout()">Lock Now</button></div>
+        <div class="admin-card"><b>📦 Text &amp; Settings Storage</b><p>Names, captions, links and settings share about 5 MB. Photos and video no longer count against this. Keep it below 85%.</p><div class="progress" style="margin:8px 0"><i id="storageBar" style="width:0%"></i></div><small id="storageText" style="color:#777">Calculating…</small></div>
+        <div class="admin-card"><b>🖼️ Media Storage (photos, art, video)</b><p>Stored separately from the 5 MB text limit, so you can keep far more. There is no hard cap — this bar is a comfort guide.</p><div class="progress" style="margin:8px 0"><i id="mediaStorageBar" style="width:0%"></i></div><small id="mediaStorageText" style="color:#777">Calculating…</small></div>
+        <div class="admin-card"><b>🔑 Change Parent Password</b><p>At least 6 characters. This takes effect immediately on this device.</p><input class="input" id="newPassInput" type="password" autocomplete="new-password" placeholder="New parent password"><input class="input" id="newPassConfirmInput" type="password" autocomplete="new-password" placeholder="Repeat new password"><button class="save" onclick="changeParentPassword()">Save New Password</button><div id="newPassHashBox" style="display:none;margin-top:10px"><small style="display:block;color:#777;margin-bottom:6px">Copy this code into the file as PARENT_PASSWORD_HASH to keep the new password after a data reset:</small><input class="input" id="newPassHashOut" readonly onclick="this.select()" style="font-size:11px"></div></div>
       </div></div>
     </div>
   </div>
@@ -1024,7 +1027,8 @@ let drawCat='all';
 let state=(()=>{try{return JSON.parse(localStorage.getItem('learningUniverse')||'null')}catch(e){return null}})()||{
   name:'Stuvi',xp:0,streak:1,badges:[],mission:0,recent:[],creations:[],birthday:[false,false,false,false,false,false,false],
   galleryPhotos:[],memories:[],socials:[],growthDreams:[],chatLang:'en',chatHistory:[],qrCode:'',giftMessage:'',videoUrl:'',videoTitle:'Stuvi\'s latest video',videoAutoplay:true,videoLoop:false,videoMuted:false,
-  lovePic:'',stories:[],artPics:[],extraCareers:[],extraDreams:[],devLinks:[],bgTheme:'default',bgImage:''
+  lovePic:'',stories:[],artPics:[],extraCareers:[],extraDreams:[],devLinks:[],bgTheme:'default',bgImage:'',
+  adminPasswordHash:'',careerVotes:{},careerSuggestions:[]
 };
 state.galleryPhotos=state.galleryPhotos||[];state.memories=state.memories||[];state.socials=state.socials||[];
 state.growthDreams=state.growthDreams||[];state.chatLang=state.chatLang||'en';state.chatHistory=state.chatHistory||[];
@@ -1037,17 +1041,233 @@ state.extraDreams=state.extraDreams||[];
 state.devLinks=state.devLinks||[];
 state.bgTheme=state.bgTheme||'default';
 state.bgImage=state.bgImage||'';
-const PARENT_PASSWORD='Devrath@1234';
+state.adminPasswordHash=state.adminPasswordHash||'';
+state.careerVotes=state.careerVotes||{};
+state.careerSuggestions=state.careerSuggestions||[];
+/* Parent Admin access.
+   The password is stored as a SHA-256 hash, not as readable text, so it is not
+   visible in View Source. This keeps honest visitors out; it is not real security,
+   because everything here runs on the visitor's own device.
+   To change the password: open the site, unlock Parent Admin, and use
+   "Change Parent Password" in Admin Tools. */
+const PARENT_PASSWORD_HASH='75956fe50fbb0c37e02c777568a94781d5012830e3390db46d9f084f1e06d32b';
+const ADMIN_SESSION_KEY='stuviAdminSession';
 let adminUnlocked=false;
+
+/** SHA-256 of a string, lowercase hex. Falls back to a simple digest only if crypto.subtle is unavailable. */
+async function hashPassword(text){
+  const s='stuvi|'+String(text);
+  try{
+    if(window.crypto&&crypto.subtle&&crypto.subtle.digest){
+      const buf=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(s));
+      return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
+    }
+  }catch(e){}
+  // Fallback for old browsers / non-secure contexts where crypto.subtle is missing.
+  let h=2166136261;
+  for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}
+  return 'fnv'+(h>>>0).toString(16).padStart(8,'0');
+}
+function setAdminUnlocked(on){
+  adminUnlocked=!!on;
+  document.body.classList.toggle('admin-auth',adminUnlocked);
+  const pb=document.getElementById('parentNavBtn');
+  if(pb)pb.style.display=adminUnlocked?'inline-flex':'none';
+  try{
+    if(adminUnlocked)sessionStorage.setItem(ADMIN_SESSION_KEY,'1');
+    else sessionStorage.removeItem(ADMIN_SESSION_KEY);
+  }catch(e){}
+}
+/* Login throttling: after 5 wrong tries, wait before trying again. */
+let loginAttempts=0,loginLockUntil=0;
+function loginLockRemaining(){return Math.max(0,Math.ceil((loginLockUntil-Date.now())/1000))}
 function openParentLogin(){document.getElementById('adminLoginModal').classList.add('show');document.getElementById('adminLoginError').textContent='';setTimeout(()=>document.getElementById('adminPasswordInput').focus(),50)}
 function closeParentLogin(){document.getElementById('adminLoginModal').classList.remove('show');document.getElementById('adminPasswordInput').value=''}
-function verifyParentPassword(){const v=document.getElementById('adminPasswordInput').value;if(v===PARENT_PASSWORD){adminUnlocked=true;document.body.classList.add('admin-auth');const pb=document.getElementById('parentNavBtn');if(pb)pb.style.display='inline-flex';closeParentLogin();go('parent');toast('🔓 Parent Admin unlocked')}else{document.getElementById('adminLoginError').textContent='Incorrect password. Please try again.'}}
+async function verifyParentPassword(){
+  const err=document.getElementById('adminLoginError');
+  const wait=loginLockRemaining();
+  if(wait>0){err.textContent='Too many attempts. Please wait '+wait+'s and try again.';return}
+  const v=document.getElementById('adminPasswordInput').value;
+  const h=await hashPassword(v);
+  if(h===(state.adminPasswordHash||PARENT_PASSWORD_HASH)){
+    loginAttempts=0;loginLockUntil=0;
+    setAdminUnlocked(true);
+    closeParentLogin();go('parent');toast('🔓 Parent Admin unlocked');
+  }else{
+    loginAttempts++;
+    if(loginAttempts>=5){loginLockUntil=Date.now()+30000;loginAttempts=0;err.textContent='Too many attempts. Please wait 30s and try again.'}
+    else err.textContent='Incorrect password. Please try again.'+(5-loginAttempts<=2?' ('+(5-loginAttempts)+' tries left)':'');
+  }
+}
 function requireAdmin(){if(!adminUnlocked){toast('🔒 Parent Admin access required');openParentLogin();return false}return true}
-function adminLogout(){adminUnlocked=false;document.body.classList.remove('admin-auth');const pb=document.getElementById('parentNavBtn');if(pb)pb.style.display='none';go('home');toast('🔐 Parent Admin locked')}
-function exportAdminData(){if(!requireAdmin())return;const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='stuvi-learning-universe-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)}
-function importAdminData(){if(!requireAdmin())return;const f=document.getElementById('importAdminFile').files[0];if(!f){toast('Choose a backup JSON file first');return}const r=new FileReader();r.onload=()=>{try{const data=JSON.parse(r.result);if(!data||typeof data!=='object')throw new Error();state={...state,...data};save();toast('📥 Backup restored')}catch(e){toast('Invalid Stuvi backup file')}};r.readAsText(f)}
-function resetAllData(){if(!requireAdmin())return;if(confirm('Reset all Stuvi website data stored in this browser?')){localStorage.removeItem('learningUniverse');location.reload()}}
-function save(){let ok=true;try{localStorage.setItem('learningUniverse',JSON.stringify(state))}catch(e){ok=false}render();return ok}
+function adminLogout(){setAdminUnlocked(false);go('home');toast('🔐 Parent Admin locked')}
+
+/* Change the parent password from Admin Tools. */
+async function changeParentPassword(){
+  if(!requireAdmin())return;
+  const a=(document.getElementById('newPassInput')?.value||''),b=(document.getElementById('newPassConfirmInput')?.value||'');
+  if(a.length<6){toast('Use at least 6 characters 🔐');return}
+  if(a!==b){toast('The two passwords do not match');return}
+  const h=await hashPassword(a);
+  showNewPasswordHash(h);
+  state.adminPasswordHash=h;
+  save();
+  toast('🔐 Password changed. Copy the new hash into the file to keep it after a reset.');
+}
+function showNewPasswordHash(h){
+  const box=document.getElementById('newPassHashBox');
+  const out=document.getElementById('newPassHashOut');
+  if(out)out.value=h;
+  if(box)box.style.display='block';
+}
+function exportAdminData(){if(!requireAdmin())return;const out={...state};delete out.adminPasswordHash;const blob=new Blob([JSON.stringify(out,null,2)],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='stuvi-learning-universe-backup.json';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)}
+function importAdminData(){if(!requireAdmin())return;const f=document.getElementById('importAdminFile').files[0];if(!f){toast('Choose a backup JSON file first');return}const r=new FileReader();r.onload=()=>{try{const data=JSON.parse(r.result);if(!data||typeof data!=='object')throw new Error();delete data.adminPasswordHash;state={...state,...data};if(save())toast('📥 Backup restored');else toast('Backup restored but this device could not store it — try removing photos first')}catch(e){toast('Invalid Stuvi backup file')}};r.readAsText(f)}
+function resetAllData(){if(!requireAdmin())return;if(confirm('Reset all Stuvi website data stored in this browser?')){localStorage.removeItem('learningUniverse');try{sessionStorage.removeItem(ADMIN_SESSION_KEY)}catch(e){}try{const d=_db;if(d)d.transaction(DB_STORE,'readwrite').objectStore(DB_STORE).clear();else indexedDB.deleteDatabase(DB_NAME)}catch(e){}location.reload()}}
+
+/*
+ * Storage accounting.
+ * Browsers give this page roughly 5 MB of localStorage. Photos, art, the home video
+ * and the background image all live in the same object, so it is possible to run out.
+ * save() reports the failure honestly instead of pretending the change stuck.
+ */
+/*
+ * The browser's localStorage limit is about 5 MB and cannot be raised — it is a
+ * per-origin cap, not a setting. So large media is kept in IndexedDB instead, which
+ * has no small fixed limit (usually hundreds of MB to several GB). The small text
+ * data (names, captions, links, settings) stays in localStorage as before.
+ *
+ * Every photo, artwork, memory photo, QR code, background image and uploaded video
+ * is stored in IndexedDB under key "media". In the in-memory state object each one
+ * is held as {mediaRef:'m_<id>'} — a few bytes — while the real image data lives in
+ * IndexedDB. If a reference cannot be resolved the app falls back to whatever data
+ * URL it still has, so nothing breaks and nothing is lost.
+ */
+const STORAGE_LIMIT_BYTES=5*1024*1024;      // the localStorage cap, for the text data
+const MEDIA_SOFT_WARN_BYTES=200*1024*1024;  // warn in the admin panel past ~200 MB of media
+const DB_NAME='stuviLearningUniverse';
+const DB_STORE='media';
+let _db=null,_dbFailed=false;
+const _mediaMem=new Map();
+const _mediaWrites=[];
+
+function openDB(){
+  if(_db)return Promise.resolve(_db);
+  if(_dbFailed)return Promise.resolve(null);
+  return new Promise(resolve=>{
+    let req;
+    try{req=indexedDB.open(DB_NAME,1)}catch(e){_dbFailed=true;return resolve(null)}
+    req.onupgradeneeded=()=>{const d=req.result;if(!d.objectStoreNames.contains(DB_STORE))d.createObjectStore(DB_STORE)};
+    req.onsuccess=()=>{_db=req.result;resolve(_db)};
+    req.onerror=()=>{_dbFailed=true;resolve(null)};
+  });
+}
+/* Write media now; if the database is not ready yet, queue the write. */
+function mediaPut(key,value){
+  if(_db){return new Promise(res=>{try{const tx=_db.transaction(DB_STORE,'readwrite');tx.objectStore(DB_STORE).put(value,key);tx.oncomplete=()=>res(true);tx.onerror=()=>res(false)}catch(e){res(false)}})}
+  const p=openDB().then(db=>{
+    if(!db)return false;
+    return new Promise(res=>{try{const tx=db.transaction(DB_STORE,'readwrite');tx.objectStore(DB_STORE).put(value,key);tx.oncomplete=()=>res(true);tx.onerror=()=>res(false)}catch(e){res(false)}});
+  });
+  _mediaWrites.push(p);
+  return p;
+}
+function mediaGet(key){
+  if(_mediaMem.has(key))return Promise.resolve(_mediaMem.get(key));
+  if(_dbFailed)return Promise.resolve(null);
+  return openDB().then(db=>{
+    if(!db)return null;
+    return new Promise(res=>{try{const tx=db.transaction(DB_STORE,'readonly');const r=tx.objectStore(DB_STORE).get(key);r.onsuccess=()=>res(r.result||null);r.onerror=()=>res(null)}catch(e){res(null)}});
+  });
+}
+function mediaDelete(key){try{if(_db){const tx=_db.transaction(DB_STORE,'readwrite');tx.objectStore(DB_STORE).delete(key)}}catch(e){}}
+
+/* Replace a data URL with a tiny reference and store the real data in IndexedDB. */
+function toRef(dataUrl){
+  if(!dataUrl||typeof dataUrl!=='string'||!dataUrl.startsWith('data:'))return dataUrl||'';
+  const key='m_'+Math.random().toString(36).slice(2)+Date.now().toString(36);
+  _mediaMem.set(key,dataUrl);
+  mediaPut(key,dataUrl);
+  return {mediaRef:key};
+}
+function isRef(v){return v&&typeof v==='object'&&v.mediaRef}
+/* Resolve a stored value (reference or plain data URL) back to usable image data. */
+function resolveMedia(v){
+  if(isRef(v))return mediaGet(v.mediaRef);
+  return Promise.resolve(v||'');
+}
+/* Free IndexedDB entries that are no longer referenced anywhere in the state. */
+async function gcMedia(){
+  const db=await openDB();
+  if(!db)return;
+  const live=new Set();
+  const scan=v=>{
+    if(!v)return;
+    if(isRef(v))return live.add(v.mediaRef);
+    if(Array.isArray(v))return v.forEach(scan);
+    if(typeof v==='object')return Object.values(v).forEach(scan);
+  };
+  scan(state);
+  try{
+    const keys=await new Promise(res=>{const r=db.transaction(DB_STORE,'readonly').objectStore(DB_STORE).getAllKeys();r.onsuccess=()=>res(r.result||[]);r.onerror=()=>res([])});
+    keys.forEach(k=>{if(!live.has(k))mediaDelete(k)});
+  }catch(e){}
+}
+
+function stateBytes(){
+  try{return new Blob([JSON.stringify(state)]).size}catch(e){return 0}
+}
+function storageUsedPct(){return Math.min(100,Math.round(stateBytes()/STORAGE_LIMIT_BYTES*100))}
+function storageFullMessage(){
+  return '⚠️ The text part of this site is out of room ('+storageUsedPct()+'% of about 5 MB). Photos and video no longer use this space — try removing some text-heavy entries, then save again.';
+}
+/* Total size of everything kept in IndexedDB, for the admin meter. */
+async function mediaBytes(){
+  const db=await openDB();
+  if(!db)return 0;
+  try{
+    const vals=await new Promise(res=>{const r=db.transaction(DB_STORE,'readonly').objectStore(DB_STORE).getAll();r.onsuccess=()=>res(r.result||[]);r.onerror=()=>res([])});
+    return vals.reduce((a,v)=>a+(typeof v==='string'?v.length:0),0);
+  }catch(e){return 0}
+}
+function fmtMB(bytes){return (bytes/1048576).toFixed(bytes>=10485760?0:2)+' MB'}
+function renderStorageMeter(){
+  const pct=storageUsedPct(),bytes=stateBytes();
+  const bar=document.getElementById('storageBar'),txt=document.getElementById('storageText');
+  if(bar)bar.style.width=pct+'%';
+  if(txt){
+    txt.textContent=fmtMB(bytes)+' of about 5 MB used for text and settings ('+pct+'%)'+(pct>=85?' — nearly full.':'');
+    txt.style.color=pct>=85?'#c43a68':'#777';
+  }
+  mediaBytes().then(mb=>{
+    const el=document.getElementById('mediaStorageText'),bar2=document.getElementById('mediaStorageBar');
+    if(!el)return;
+    const warn=mb>=MEDIA_SOFT_WARN_BYTES;
+    el.textContent=fmtMB(mb)+' of photos, art and video stored on this device'+(warn?' — getting large for one device.':'');
+    el.style.color=warn?'#c43a68':'#777';
+    if(bar2)bar2.style.width=Math.min(100,Math.round(mb/MEDIA_SOFT_WARN_BYTES*100))+'%';
+  });
+}
+
+function save(){let ok=true;try{localStorage.setItem('learningUniverse',JSON.stringify(state))}catch(e){ok=false}render();if(!ok)toast(storageFullMessage());return ok}
+
+/*
+ * Save a change and say clearly whether it stuck.
+ * "Saved" is only shown when the write really happened, so the screen never
+ * claims a change that is not in storage.
+ */
+function persist(okMessage){
+  if(save()){if(okMessage)toast(okMessage);return true}
+  toast(storageFullMessage());
+  return false;
+}
+/* Same, but restores the previous value when the write fails. */
+function persistWithRollback(field,previous,okMessage){
+  if(save()){if(okMessage)toast(okMessage);return true}
+  if(field)state[field]=previous;
+  render();
+  toast(storageFullMessage());
+  return false;
+}
 function setPhotos(){
   [['avatarImg',state.photo||DEFAULT_AVATAR],['heroImg',state.photo||DEFAULT_PHOTO]].forEach(([id,src])=>{
     const im=document.getElementById(id);
@@ -1122,7 +1342,7 @@ function renderFamily(){
   document.getElementById('relList').innerHTML=others.map(r=>`<div class="relchip" onclick="openRelative('${r.id}')">${r.pic?`<img class="rphoto" src="${escapeHtml(r.pic)}" alt="">`:(REL_EMOJI[r.rel]||'🌟')} <b>${escapeHtml(r.name)}</b><small>${escapeHtml(r.rel)}</small></div>`).join('')||'<p style="color:#8b8aa3;margin:0 0 12px">No one added yet. Tap “Add a family member”.</p>';
   const b=state.blessings||[];
   document.getElementById('blessCount').textContent=b.length+(b.length===1?' blessing':' blessings');
-  document.getElementById('blessList').innerHTML=b.map(x=>`<div class="bless"><button class="x" onclick="removeBlessing('${x.id}')" aria-label="Remove">✕</button><b>🙏 ${escapeHtml(x.name)}</b><p>${escapeHtml(x.msg)}</p><small>${escapeHtml(x.date)}</small></div>`).join('')||'<p style="color:#8b8aa3">Be the first to leave a blessing! 💖</p>';
+  document.getElementById('blessList').innerHTML=b.map(x=>`<div class="bless">${adminUnlocked?`<button class="x" data-action="del-blessing" data-id="${escapeHtml(x.id)}" aria-label="Remove">✕</button>`:''}<b>🙏 ${escapeHtml(x.name)}</b><p>${escapeHtml(x.msg)}</p><small>${escapeHtml(x.date)}</small></div>`).join('')||'<p style="color:#8b8aa3">Be the first to leave a blessing! 💖</p>';
 }
 let pmPicData; // undefined = unchanged, string = new photo, null = photo removed
 function squareCrop(w,h){const side=Math.min(w,h);return{side,sx:(w-side)/2,sy:h>w?(h-side)*0.25:(h-side)/2}}
@@ -1200,8 +1420,9 @@ function addBlessing(){
   state.blessings=state.blessings||[];
   state.blessings.unshift({id:uid('b'),name:n,msg:m||'Sending you lots of love and blessings! 💖',date:new Date().toLocaleDateString()});
   state.blessings=state.blessings.slice(0,200);
-  document.getElementById('blName').value='';document.getElementById('blMsg').value='';
-  save();toast('🙏 Thank you for your blessing!');
+  if(persist('🙏 Thank you for your blessing!')){document.getElementById('blName').value='';document.getElementById('blMsg').value=''}
+  else{state.blessings.shift()}
+  renderFamily();
 }
 function removeBlessing(id){state.blessings=(state.blessings||[]).filter(x=>x.id!==id);save()}
 function sendBlessingWA(){
@@ -1223,14 +1444,14 @@ function savePhoto(){if(!requireAdmin())return;
       ctx.drawImage(img,0,0,c.width,c.height);
       const p=imgPreset('profile');
       const mime=supportsWebP()?'image/webp':'image/jpeg';
-      const old=state.photo;state.photo=c.toDataURL(mime,supportsWebP()?p.webp:p.jpeg);
+      const old=state.photo;state.photo=toRef(c.toDataURL(mime,supportsWebP()?p.webp:p.jpeg));
       if(save())toast('Photo saved! 📸'+(supportsWebP()?' (WebP)':''));else{state.photo=old;render();toast('Could not save the photo on this device')}
     };
     img.onerror=()=>toast('Could not read that image');
     img.src=e.target.result};
   r.readAsDataURL(f);
 }
-function removePhoto(){if(!requireAdmin())return;delete state.photo;save();toast('Back to the original photo')}
+function removePhoto(){if(!requireAdmin())return;const old=state.photo;delete state.photo;if(!save()){state.photo=old;render();toast(storageFullMessage());return}render();toast('Back to the original photo')}
 
 const CHAT_TEXT={
  en:{welcome:`Hi ${state.name}! 💖 I’m Stuvi Buddy. We can talk, learn, imagine stories and have fun together!`,hello:`Hello superstar! 🌟 How are you feeling today?`,learn:`Yay! 📚 Try this: name 3 things you can see around you, then tell me which one is your favourite.`,happy:`Here is a Stuvi smile for you: 😊✨ You are special, loved and full of wonderful ideas!`,story:`Once upon a time, ${state.name} found a tiny rainbow door. 🌈 Behind it was a library where every book could fly! 📚✨`,fallback:`That sounds lovely! 💕 Tell me more, or tap one of the buttons below.`},
@@ -1344,40 +1565,68 @@ async function addGalleryPhotos(){
  if(!requireAdmin())return;
  const inp=document.getElementById('galleryInput'),files=[...(inp?.files||[])];if(!files.length){toast('Choose one or more photos 📸');return}
  const caption=(document.getElementById('galleryCaption')?.value||'').trim();
- for(const f of files){try{state.galleryPhotos.unshift({id:uid('gp'),src:await compressImage(f,'gallery'),caption,date:new Date().toLocaleDateString()})}catch(e){}}
+ let failed=0;
+ for(const f of files){try{state.galleryPhotos.unshift({id:uid('gp'),src:toRef(await compressImage(f,'gallery')),caption,date:new Date().toLocaleDateString()})}catch(e){failed++}}
+ if(failed)toast(failed+(failed===1?' photo':' photos')+' could not be read and were skipped');
  state.galleryPhotos=state.galleryPhotos.slice(0,80);
  if(inp)inp.value='';
  const cap=document.getElementById('galleryCaption');if(cap)cap.value='';
- save();toast('📸 Photos added to Stuvi’s Gallery!');
+ if(save())toast('📸 Photos added to Stuvi’s Gallery!');
+ renderGalleryPhotos();
 }
 function renderGalleryPhotos(){
  const box=document.getElementById('photoGallery');if(!box)return;
  const note=document.getElementById('galleryEmptyNote');
  const list=state.galleryPhotos||[];
  box.innerHTML=list.map(x=>`<div class="photo-card" style="background:linear-gradient(180deg,#fff,#faf8ff);border:2px solid #efeaff">
-   ${adminUnlocked?`<button class="del" onclick="deleteGalleryPhoto('${x.id}')">×</button>`:''}
-   <img src="${x.src}" alt="Stuvi memory" onclick="openLightbox('${x.src}')" style="height:180px">
+   ${adminUnlocked?`<button class="del" data-action="del-gallery" data-id="${escapeHtml(x.id)}">×</button>`:''}
+   <img alt="Stuvi memory" data-action="open-lightbox" style="height:180px">
    <b style="display:block;margin-top:8px;text-align:center">${escapeHtml(x.caption||'A beautiful Stuvi moment 💖')}</b>
    <small style="display:block;text-align:center;color:#888">${x.date}</small>
  </div>`).join('');
+ [...box.querySelectorAll('img[data-action="open-lightbox"]')].forEach((im,i)=>setImgSrc(im,(list[i]||{}).src));
  if(note)note.style.display=list.length?'none':'block';
 }
-function deleteGalleryPhoto(id){if(!requireAdmin())return;state.galleryPhotos=state.galleryPhotos.filter(x=>x.id!==id);save();toast('Photo removed')}
+function deleteGalleryPhoto(id){
+  if(!requireAdmin())return;
+  const gone=state.galleryPhotos.find(x=>x.id===id);
+  state.galleryPhotos=state.galleryPhotos.filter(x=>x.id!==id);
+  persist('Photo removed');
+  if(gone&&isRef(gone.src))mediaDelete(gone.src.mediaRef);
+  renderGalleryPhotos();renderStorageMeter();
+}
 function openLightbox(src){document.getElementById('lightboxImg').src=src;document.getElementById('lightbox').classList.add('show')}
 function closeLightbox(){document.getElementById('lightbox').classList.remove('show')}
 
 async function addMemory(){if(!requireAdmin())return;
  const age=document.getElementById('memAge').value.trim(),title=document.getElementById('memTitle').value.trim(),story=document.getElementById('memStory').value.trim(),file=document.getElementById('memPhoto').files[0];
  if(!title||!story){toast('Please add a title and memory story 💖');return}
- let photo='';if(file)try{photo=await compressImage(file,'story')}catch(e){}
+ let photo='';if(file)try{photo=toRef(await compressImage(file,'story'))}catch(e){}
  state.memories.unshift({id:uid('m'),age:age||'A special year',title,story,photo,date:new Date().toLocaleDateString()});state.memories=state.memories.slice(0,100);
- document.getElementById('memAge').value='';document.getElementById('memTitle').value='';document.getElementById('memStory').value='';document.getElementById('memPhoto').value='';save();toast('💖 Memory saved forever on this device!');
+ if(save()){
+   document.getElementById('memAge').value='';document.getElementById('memTitle').value='';document.getElementById('memStory').value='';document.getElementById('memPhoto').value='';
+   toast('💖 Memory saved on this device!');
+ }else{
+   // Keep the typed text in the form so nothing is lost.
+   state.memories.shift();
+   toast(storageFullMessage()+' Your text is still in the boxes above.');
+ }
+ renderMemories();
 }
 function renderMemories(){
  const box=document.getElementById('memoryGrid');if(!box)return;
- box.innerHTML=state.memories.map(x=>`<div class="memory-card">${x.photo?`<img src="${x.photo}" alt="Memory">`:''}<button class="del" onclick="deleteMemory('${x.id}')">×</button><span class="stuvi-badge">🎀 ${escapeHtml(x.age)}</span><h3>${escapeHtml(x.title)}</h3><p>${escapeHtml(x.story)}</p><small>${x.date}</small></div>`).join('')||'<div class="panel">🌸 Start Stuvi’s memory book with a favourite moment from her first six years.</div>';
+ const list=state.memories||[];
+ box.innerHTML=list.map(x=>`<div class="memory-card">${x.photo?`<img alt="Memory" data-action="open-lightbox">`:''}${adminUnlocked?`<button class="del" data-action="del-memory" data-id="${escapeHtml(x.id)}">×</button>`:''}<span class="stuvi-badge">🎀 ${escapeHtml(x.age)}</span><h3>${escapeHtml(x.title)}</h3><p>${escapeHtml(x.story)}</p><small>${x.date}</small></div>`).join('')||'<div class="panel">🌸 Start Stuvi’s memory book with a favourite moment from her first six years.</div>';
+ [...box.querySelectorAll('img[data-action="open-lightbox"]')].forEach((im,i)=>setImgSrc(im,(list[i]||{}).photo));
 }
-function deleteMemory(id){if(!requireAdmin())return;state.memories=state.memories.filter(x=>x.id!==id);save()}
+function deleteMemory(id){
+  if(!requireAdmin())return;
+  const gone=state.memories.find(x=>x.id===id);
+  state.memories=state.memories.filter(x=>x.id!==id);
+  persist();
+  if(gone&&isRef(gone.photo))mediaDelete(gone.photo.mediaRef);
+  renderMemories();renderStorageMeter();
+}
 
 const GROWTH_STAGES=[
  ['Age 6','Little Explorer','Learn, play, ask lots of questions and discover new passions.','🧸'],
@@ -1391,33 +1640,36 @@ function renderGrowth(){
  const box=document.getElementById('growthTimeline');if(!box)return;
  const src=state.photo||DEFAULT_PHOTO;
  box.innerHTML=GROWTH_STAGES.map((x,i)=>`<div class="growth-stage" style="animation-delay:${i*.08}s"><img class="growth-avatar" src="${src}" alt="${x[0]} Stuvi"><div><div class="growth-age">${x[3]} ${x[0]}</div><h2 style="margin:4px 0">${x[1]}</h2><p>${x[2]}</p><span class="stuvi-badge">💖 Keep growing</span></div></div>`).join('');
- document.getElementById('dreamList').innerHTML=(state.growthDreams||[]).map((d,i)=>`<span class="chip active">🌟 ${escapeHtml(d)} <button style="background:transparent;color:#fff" onclick="deleteDream(${i})">×</button></span>`).join('');
+ document.getElementById('dreamList').innerHTML=(state.growthDreams||[]).map((d,i)=>`<span class="chip active">🌟 ${escapeHtml(d)}${adminUnlocked?` <button style="background:transparent;color:#fff" data-action="del-growth-dream" data-id="${i}">×</button>`:''}</span>`).join('');
 }
-function saveGrowthDream(){if(!requireAdmin())return;const x=document.getElementById('growthDream').value.trim();if(!x)return;state.growthDreams.unshift(x);state.growthDreams=state.growthDreams.slice(0,20);document.getElementById('growthDream').value='';save();toast('🌟 Future dream added!')}
+function saveGrowthDream(){if(!requireAdmin())return;const x=document.getElementById('growthDream').value.trim();if(!x)return;state.growthDreams.unshift(x);state.growthDreams=state.growthDreams.slice(0,20);if(persist('🌟 Future dream added!')){document.getElementById('growthDream').value=''}}
 function deleteDream(i){if(!requireAdmin())return;state.growthDreams.splice(i,1);save()}
 
 function addSocial(){if(!requireAdmin())return;
  const name=document.getElementById('socialName').value.trim(),url=document.getElementById('socialUrl').value.trim();
  if(!name||!/^https?:\/\//i.test(url)){toast('Add a platform and a full https:// link 🔗');return}
- state.socials.unshift({id:uid('s'),name,url});state.socials=state.socials.slice(0,30);document.getElementById('socialName').value='';document.getElementById('socialUrl').value='';save();toast('📱 Social link added!')
+ state.socials.unshift({id:uid('s'),name,url});state.socials=state.socials.slice(0,30);
+ if(save()){document.getElementById('socialName').value='';document.getElementById('socialUrl').value='';toast('📱 Social link added!')}else{state.socials.shift();toast(storageFullMessage())}
+ renderSocial();
 }
 function renderSocial(){
  const box=document.getElementById('socialList');if(!box)return;
  const icon=n=>/youtube/i.test(n)?'▶️':/instagram/i.test(n)?'📸':/facebook/i.test(n)?'🔵':/whatsapp/i.test(n)?'💬':'🔗';
- box.innerHTML=state.socials.map(x=>`<div class="social-card"><div><span class="social-icon">${icon(x.name)}</span> <b>${escapeHtml(x.name)}</b></div><div class="btnrow"><a class="save" href="${escapeHtml(x.url)}" target="_blank" rel="noopener">Open ↗</a><button class="save" style="background:#8b8aa3" onclick="deleteSocial('${x.id}')">Delete</button></div></div>`).join('')||'<div class="panel">📱 Add Stuvi’s YouTube, Instagram or other social link here.</div>';
+ box.innerHTML=state.socials.map(x=>`<div class="social-card"><div><span class="social-icon">${icon(x.name)}</span> <b>${escapeHtml(x.name)}</b></div><div class="btnrow"><a class="save" href="${escapeHtml(x.url)}" target="_blank" rel="noopener">Open ↗</a>${adminUnlocked?`<button class="save" style="background:#8b8aa3" data-action="del-social" data-id="${escapeHtml(x.id)}">Delete</button>`:''}</div></div>`).join('')||'<div class="panel">📱 Add Stuvi’s YouTube, Instagram or other social link here.</div>';
 }
 function deleteSocial(id){if(!requireAdmin())return;state.socials=state.socials.filter(x=>x.id!==id);save()}
 
 async function saveQR(){if(!requireAdmin())return;
  const f=document.getElementById('qrInput').files[0];if(!f){toast('Choose your QR image first 📲');return}
- try{state.qrCode=await compressImage(f,'qr');save();toast('🎁 QR code saved!')}catch(e){toast('Could not read that QR image')}
+ try{state.qrCode=toRef(await compressImage(f,'qr'));persist('🎁 QR code saved!')}catch(e){toast('Could not read that QR image')}
 }
-function removeQR(){if(!requireAdmin())return;state.qrCode='';save();toast('QR code removed')}
-function saveGiftMessage(){if(!requireAdmin())return;state.giftMessage=document.getElementById('giftMessage').value.trim();save();toast('💌 Gift message saved!')}
+function removeQR(){if(!requireAdmin())return;state.qrCode='';persist('QR code removed')}
+function saveGiftMessage(){if(!requireAdmin())return;state.giftMessage=document.getElementById('giftMessage').value.trim();persist('💌 Gift message saved!')}
 function renderHomeVideo(){
   const v=document.getElementById('stuviHomeVideo'), empty=document.getElementById('homeVideoEmpty'), title=document.getElementById('homeVideoTitle'), card=document.getElementById('homeVideoCard');
   if(!v)return;
-  const src=state.videoUrl||'';
+  let src=state.videoUrl||'';
+  if(isRef(src)){v.style.display='block';empty.style.display='none';resolveMedia(src).then(d=>{if(d&&v.dataset.src!==d){v.dataset.src=d;v.src=d;v.load()}});return;}
   const autoplay=!!state.videoAutoplay;
   const muted=!!state.videoMuted;
   if(card)document.body.classList.toggle('video-floating-active',!!src);
@@ -1456,25 +1708,33 @@ function renderHomeVideo(){
     v.pause();v.removeAttribute('src');v.removeAttribute('autoplay');v.load();v.style.display='none';empty.style.display='block';
   }
   const ti=document.getElementById('videoTitleInput'),ui=document.getElementById('videoUrlInput'),ai=document.getElementById('videoAutoplayInput'),li=document.getElementById('videoLoopInput'),mi=document.getElementById('videoMutedInput');
-  if(ti)ti.value=state.videoTitle||''; if(ui)ui.value=(state.videoUrl||'').startsWith('data:')?'':(state.videoUrl||''); if(ai)ai.checked=autoplay; if(li)li.checked=!!state.videoLoop; if(mi)mi.checked=muted;
+  if(ti)ti.value=state.videoTitle||''; if(ui)ui.value=(typeof state.videoUrl==='string'&&state.videoUrl.startsWith('http'))?state.videoUrl:''; if(ai)ai.checked=autoplay; if(li)li.checked=!!state.videoLoop; if(mi)mi.checked=muted;
 }
 async function saveHomeVideo(){
   if(!requireAdmin())return;
   const file=document.getElementById('videoFileInput')?.files?.[0]; const url=document.getElementById('videoUrlInput')?.value.trim();
   try{
-    if(file){if(file.size>8*1024*1024){toast('Please use a video under 8 MB, or use a video URL.');return;} state.videoUrl=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(file)});}
+    if(file){
+      // Uploaded video now lives in IndexedDB, so the limit is generous rather than the
+      // old 8 MB that shared space with everything else. A URL is still best for long clips.
+      if(file.size>60*1024*1024){toast('That video is over 60 MB. Please use a video URL for long clips.');return;}
+      const dataUrl=await new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(r.result);r.onerror=rej;r.readAsDataURL(file)});
+      state.videoUrl=toRef(dataUrl);
+    }
     else state.videoUrl=url;
     state.videoTitle=document.getElementById('videoTitleInput').value.trim()||"Stuvi's latest video";
     state.videoAutoplay=document.getElementById('videoAutoplayInput').checked; state.videoLoop=document.getElementById('videoLoopInput').checked; state.videoMuted=document.getElementById('videoMutedInput').checked;
-    save(); renderHomeVideo(); toast('🎬 Home video settings saved!');
+    persist('🎬 Home video settings saved!');
+    renderHomeVideo();
+    renderStorageMeter();
   }catch(e){toast('Could not save that video. Try a smaller file or URL.')}
 }
-function removeHomeVideo(){if(!requireAdmin())return;state.videoUrl='';save();renderHomeVideo();toast('🎬 Home video removed')}
+function removeHomeVideo(){if(!requireAdmin())return;state.videoUrl='';persist('🎬 Home video removed');renderHomeVideo();renderStorageMeter()}
 
 function renderQR(){
  const box=document.getElementById('qrDisplay');if(box){
    document.getElementById('giftMessage').value=state.giftMessage||'';
-   box.innerHTML=state.qrCode?`<img class="qr-preview" src="${state.qrCode}" alt="Gift QR code"><h3>💖 A Gift for Stuvi</h3><p>${escapeHtml(state.giftMessage||'Thank you for celebrating Stuvi and sending your love! 💕')}</p>`:'<div style="font-size:60px">🎁💖🎁</div><h3>Your QR code will appear here</h3><p>Upload it above to create Stuvi’s gift corner.</p>';
+   box.innerHTML=state.qrCode?`<img class="qr-preview" alt="Gift QR code"><h3>💖 A Gift for Stuvi</h3><p>${escapeHtml(state.giftMessage||'Thank you for celebrating Stuvi and sending your love! 💕')}</p>`:'<div style="font-size:60px">🎁💖🎁</div><h3>Your QR code will appear here</h3><p>Upload it above to create Stuvi’s gift corner.</p>';
  }
  const h=document.getElementById('homeGiftCard'),hi=document.getElementById('homeGiftQR'),hm=document.getElementById('homeGiftMessage');
  const heading=document.getElementById('homeGiftHeading');
@@ -1482,7 +1742,7 @@ function renderQR(){
    const hasContent=!!(state.qrCode||state.lovePic);
    h.classList.toggle('empty',!hasContent);
    if(hi){
-     if(state.qrCode){hi.src=state.qrCode;hi.style.display='';}
+     if(state.qrCode){resolveMedia(state.qrCode).then(d=>{if(d){hi.src=d;hi.style.display=''}})}
      else{hi.removeAttribute('src');hi.style.display='none';}
    }
    if(hm) hm.textContent=state.giftMessage||(state.qrCode?'If you would like to send Stuvi a gift, you can use the QR code below. 💖':'Send lots of love, blessings and support to Stuvi 💖');
@@ -1492,7 +1752,7 @@ function renderQR(){
  const supportQR=document.getElementById('homeSupportQR');
  const supportCard=document.getElementById('homeQRSupport');
  if(supportQR){
-   if(state.qrCode){supportQR.src=state.qrCode;supportQR.style.display='block';}
+   if(state.qrCode){resolveMedia(state.qrCode).then(d=>{if(d){supportQR.src=d;supportQR.style.display='block'}})}
    else{supportQR.removeAttribute('src');supportQR.style.display='none';}
  }
  if(supportCard){
@@ -1529,8 +1789,63 @@ function render(){
   document.getElementById('recent').innerHTML=state.recent.slice(0,4).map(x=>`<div class="activity"><div class="ico">${x.icon}</div><div><b>${x.title}</b><small style="display:block;color:#777">${x.area} • +${x.xp} XP</small></div></div>`).join('')||'<p style="color:#777">Complete an activity to see it here.</p>';
   document.getElementById('badges').innerHTML=defaultBadges.slice(0,6).map((b,i)=>`<div class="badge"><b>${state.badges.includes(i)?b[0]:'🔒'}</b>${b[1]}</div>`).join('');
   document.getElementById('galleryList').innerHTML=state.creations.map(c=>`<div class="panel"><h3>🪐 ${escapeHtml(c.name)}</h3><p>${escapeHtml(c.power)}</p><small>${c.date}</small></div>`).join('')||'<p>No creations yet. Visit Creative Studio!</p>';
+  bindAllActions();
+  renderStorageMeter();
 }
 function escapeHtml(s){return String(s).replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#039;'}[m]));}
+
+/*
+ * Click routing for dynamically rendered lists.
+ * Buttons and images carry only a short data-action / data-id attribute, and one
+ * listener per container dispatches the work. Large data URLs (photos, videos)
+ * and captions are therefore never written into inline onclick="..." strings, which
+ * previously could break the page or inject code through a quote in a caption.
+ */
+function bindActions(root){
+  if(!root||root.dataset.actionsBound)return;
+  root.dataset.actionsBound='1';
+  root.addEventListener('click',e=>{
+    const el=e.target.closest('[data-action]');
+    if(!el||!root.contains(el))return;
+    const id=el.dataset.id||'';
+    switch(el.dataset.action){
+      case 'open-lightbox': openLightbox(el.dataset.src||''); break;
+      case 'del-gallery':   deleteGalleryPhoto(id); break;
+      case 'del-art':       deleteArtPic(id); break;
+      case 'del-story':     deleteStoryItem(id); break;
+      case 'del-career':    deleteCareerItem(id); break;
+      case 'del-dream':     deleteDreamItem(id); break;
+      case 'del-dev':       deleteDevLink(id); break;
+      case 'del-memory':    deleteMemory(id); break;
+      case 'del-social':    deleteSocial(id); break;
+      case 'del-growth-dream': deleteDream(Number(id)); break;
+      case 'del-blessing':  removeBlessing(id); break;
+      default: return;
+    }
+    e.preventDefault();
+  });
+}
+/* Bind every dynamic container once, at startup. */
+function bindAllActions(){
+  ['photoGallery','galleryList','artGalleryGrid','storyList','adminStoryList','careerRecommended','careerCustomList','dreamsCustomList','adminDreamList','developmentPageList','adminDevList','adminArtList','adminCareerList','memoryGrid','dreamList','socialList','blessList']
+    .forEach(id=>{const el=document.getElementById(id);if(el)bindActions(el)});
+}
+
+/*
+ * Safe way to hand a stored image to a click handler: the data URL is written into
+ * a dataset attribute through the DOM (never through an HTML string), so quotes and
+ * angle brackets inside it cannot escape or break the markup.
+ */
+function setImgSrc(el,src){
+  if(!el)return;
+  el.setAttribute('data-action','open-lightbox');
+  if(isRef(src)){
+    resolveMedia(src).then(d=>{if(d){el.dataset.src=d;el.src=d}});
+    return;
+  }
+  el.dataset.src=src||'';
+  el.src=src||'';
+}
 function toast(msg){const t=document.getElementById('toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),2200)}
 function earn(xp,title,area,icon='⭐',badgeIndex=null){
   state.xp+=xp;state.mission=Math.min(3,state.mission+1);
@@ -1630,6 +1945,7 @@ At last they succeeded! ${name} learned that ${lesson}.
 
 ${ending}`;
   lastGeneratedStory={title,body};
+  try{sessionStorage.setItem('stuviLastStory',JSON.stringify(lastGeneratedStory))}catch(e){}
   const box=document.getElementById('generatedStoryBox');
   const t=document.getElementById('generatedStoryTitle');
   const b=document.getElementById('generatedStoryBody');
@@ -1642,6 +1958,9 @@ ${ending}`;
   else toast('✨ New story generated!');
 }
 function saveGeneratedStory(){
+  if(!lastGeneratedStory){
+    try{const raw=sessionStorage.getItem('stuviLastStory');if(raw)lastGeneratedStory=JSON.parse(raw)}catch(e){}
+  }
   if(!lastGeneratedStory){toast('Generate a story first');return;}
   state.stories=state.stories||[];
   state.stories.unshift({
@@ -1671,33 +1990,43 @@ function addStoryItem(){
   const file=document.getElementById('storyPicInput')?.files?.[0];
   if(!title){toast('Please add a story title 💜');return;}
   const finish=(pic)=>{
-    state.stories.unshift({id:uid('st'),type,title,body,link,pic:pic||''});
+    state.stories.unshift({id:uid('st'),type,title,body,link,pic:pic?toRef(pic):''});
     state.stories=state.stories.slice(0,40);
     ['storyTitleInput','storyBodyInput','storyLinkInput'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
     const fi=document.getElementById('storyPicInput');if(fi)fi.value='';
-    save();renderStories();toast('📚 Story added!');
+    const saved=save();
+    if(saved){
+      ['storyTitleInput','storyBodyInput','storyLinkInput'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
+      const fi=document.getElementById('storyPicInput');if(fi)fi.value='';
+      toast('📚 Story added!');
+    }else{
+      state.stories.shift();
+      toast(storageFullMessage()+' Your text is still in the boxes above.');
+    }
+    renderStories();
   };
   if(file){compressImage(file,'story').then(finish).catch(()=>toast('Could not read image'));}
   else finish('');
 }
-function deleteStoryItem(id){if(!requireAdmin())return;state.stories=(state.stories||[]).filter(x=>x.id!==id);save();renderStories();toast('Story removed')}
+function deleteStoryItem(id){if(!requireAdmin())return;state.stories=(state.stories||[]).filter(x=>x.id!==id);persist('Story removed');renderStories()}
 function renderStories(){
   const box=document.getElementById('storyList');
   const admin=document.getElementById('adminStoryList');
   const list=state.stories||[];
   if(box){
     box.innerHTML=list.map(s=>`<div class="panel" style="background:linear-gradient(135deg,#fff,#f8f4ff)">
-      ${s.pic?`<img src="${s.pic}" alt="${escapeHtml(s.title)}" style="width:100%;max-height:420px;object-fit:contain;background:#fff8f5;border-radius:14px;margin-bottom:10px" onclick="openLightbox('${s.pic}')">`:''}
+      ${s.pic?`<img alt="${escapeHtml(s.title)}" data-action="open-lightbox" data-src="" style="width:100%;max-height:420px;object-fit:contain;background:#fff8f5;border-radius:14px;margin-bottom:10px">`:''}
       <span class="stuvi-badge">${s.type==='pic'?'🖼️ Picture':s.type==='link'?'🔗 Link':'📝 Text'}</span>
       <h3 style="margin:8px 0 6px">${escapeHtml(s.title)}</h3>
       ${s.body?`<p style="line-height:1.55">${escapeHtml(s.body)}</p>`:''}
       ${s.link?`<a class="save" href="${escapeHtml(s.link)}" target="_blank" rel="noopener" style="display:inline-block;margin-top:8px">Open story link ↗</a>`:''}
     </div>`).join('')||'<div class="panel" style="text-align:center;color:#888">No stories yet. Parents can add text, picture or link stories from Parent Admin.</div>';
+    [...box.querySelectorAll('img[data-action="open-lightbox"]')].forEach((im,i)=>setImgSrc(im,(list[i]||{}).pic));
   }
   if(admin){
     admin.innerHTML=list.map(s=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee">
       <span style="font-size:13px;font-weight:700">${escapeHtml(s.title)} <small style="color:#888">(${s.type})</small></span>
-      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" onclick="deleteStoryItem('${s.id}')">✕</button>
+      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" data-action="del-story" data-id="${escapeHtml(s.id)}">✕</button>
     </div>`).join('')||'<small style="color:#888">No stories yet</small>';
   }
 }
@@ -1708,15 +2037,25 @@ async function addArtPics(){
   const files=[...(document.getElementById('artPicInput')?.files||[])];
   if(!files.length){toast('Choose art images 🎨');return;}
   const caption=(document.getElementById('artCaptionInput')?.value||'').trim();
+  let failed=0;
   for(const f of files){
-    try{state.artPics.unshift({id:uid('ar'),src:await compressImage(f,'gallery'),caption,date:new Date().toLocaleDateString()})}catch(e){}
+    try{state.artPics.unshift({id:uid('ar'),src:toRef(await compressImage(f,'gallery')),caption,date:new Date().toLocaleDateString()})}catch(e){failed++}
   }
+  if(failed)toast(failed+(failed===1?' image':' images')+' could not be read and were skipped');
   state.artPics=state.artPics.slice(0,60);
   const fi=document.getElementById('artPicInput');if(fi)fi.value='';
   const ci=document.getElementById('artCaptionInput');if(ci)ci.value='';
-  save();renderArtGallery();toast('🎨 Art added to collection!');
+  if(save())toast('🎨 Art added to collection!');
+  renderArtGallery();
 }
-function deleteArtPic(id){if(!requireAdmin())return;state.artPics=(state.artPics||[]).filter(x=>x.id!==id);save();renderArtGallery();toast('Art removed')}
+function deleteArtPic(id){
+  if(!requireAdmin())return;
+  const gone=(state.artPics||[]).find(x=>x.id===id);
+  state.artPics=(state.artPics||[]).filter(x=>x.id!==id);
+  persist('Art removed');
+  if(gone&&isRef(gone.src))mediaDelete(gone.src.mediaRef);
+  renderArtGallery();renderStorageMeter();
+}
 function renderArtGallery(){
   const box=document.getElementById('artGalleryGrid');
   const note=document.getElementById('artEmptyNote');
@@ -1724,17 +2063,18 @@ function renderArtGallery(){
   const list=state.artPics||[];
   if(box){
     box.innerHTML=list.map(x=>`<div class="photo-card" style="background:linear-gradient(180deg,#fff,#faf6ff);border:2px solid #efe8ff;box-shadow:0 12px 28px #7147e814">
-      ${adminUnlocked?`<button class="del" onclick="deleteArtPic('${x.id}')">×</button>`:''}
-      <img src="${x.src}" alt="Art" onclick="openLightbox('${x.src}')" style="height:200px">
+      ${adminUnlocked?`<button class="del" data-action="del-art" data-id="${escapeHtml(x.id)}">×</button>`:''}
+      <img alt="Art" data-action="open-lightbox" style="height:200px">
       <b style="display:block;margin-top:8px;text-align:center">${escapeHtml(x.caption||'Stuvi\'s artwork 🎨')}</b>
       <small style="display:block;text-align:center;color:#888">${x.date||''}</small>
     </div>`).join('');
+    [...box.querySelectorAll('img[data-action="open-lightbox"]')].forEach((im,i)=>setImgSrc(im,(list[i]||{}).src));
   }
   if(note)note.style.display=list.length?'none':'block';
   if(admin){
     admin.innerHTML=list.slice(0,8).map(x=>`<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid #eee">
       <span style="font-size:13px">${escapeHtml(x.caption||'Artwork')}</span>
-      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" onclick="deleteArtPic('${x.id}')">✕</button>
+      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" data-action="del-art" data-id="${escapeHtml(x.id)}">✕</button>
     </div>`).join('')||'<small style="color:#888">No art yet</small>';
   }
 }
@@ -1749,9 +2089,10 @@ function addCareerItem(){
   state.extraCareers.unshift({id:uid('cr'),emoji,title,desc});
   state.extraCareers=state.extraCareers.slice(0,30);
   ['careerTitleInput','careerDescInput','careerEmojiInput'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
-  save();renderCareers();toast('💼 Career added!');
+  persist('💼 Career added!');
+  renderCareers();
 }
-function deleteCareerItem(id){if(!requireAdmin())return;state.extraCareers=(state.extraCareers||[]).filter(x=>x.id!==id);save();renderCareers();toast('Removed')}
+function deleteCareerItem(id){if(!requireAdmin())return;state.extraCareers=(state.extraCareers||[]).filter(x=>x.id!==id);persist('Removed');renderCareers()}
 function renderCareers(){
   const rec=document.getElementById('careerRecommended');
   const custom=document.getElementById('careerCustomList');
@@ -1769,13 +2110,13 @@ function renderCareers(){
       <div style="font-size:36px">${escapeHtml(c.emoji||'💼')}</div>
       <h3 style="margin:8px 0 6px">${escapeHtml(c.title)}</h3>
       <p style="font-size:14px;color:#555;margin:0">${escapeHtml(c.desc||'')}</p>
-      ${adminUnlocked?`<button class="save" style="background:#8b8aa3;margin-top:10px;padding:8px 12px;font-size:12px" onclick="deleteCareerItem('${c.id}')">Remove</button>`:''}
+      ${adminUnlocked?`<button class="save" style="background:#8b8aa3;margin-top:10px;padding:8px 12px;font-size:12px" data-action="del-career" data-id="${escapeHtml(c.id)}">Remove</button>`:''}
     </div>`).join('')||'<div class="panel" style="text-align:center;color:#888">No extra careers yet. Parents can add more from Parent Admin.</div>';
   }
   if(admin){
     admin.innerHTML=(state.extraCareers||[]).map(c=>`<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid #eee">
       <span style="font-size:13px">${escapeHtml(c.emoji||'')} ${escapeHtml(c.title)}</span>
-      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" onclick="deleteCareerItem('${c.id}')">✕</button>
+      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" data-action="del-career" data-id="${escapeHtml(c.id)}">✕</button>
     </div>`).join('')||'<small style="color:#888">None yet</small>';
   }
 }
@@ -1790,9 +2131,10 @@ function addDreamItem(){
   state.extraDreams.unshift({id:uid('dr'),emoji,title,desc});
   state.extraDreams=state.extraDreams.slice(0,30);
   ['dreamTitleInput','dreamDescInput','dreamEmojiInput'].forEach(id=>{const el=document.getElementById(id);if(el)el.value='';});
-  save();renderDreams();toast('🌙 Dream added!');
+  persist('🌙 Dream added!');
+  renderDreams();
 }
-function deleteDreamItem(id){if(!requireAdmin())return;state.extraDreams=(state.extraDreams||[]).filter(x=>x.id!==id);save();renderDreams();toast('Removed')}
+function deleteDreamItem(id){if(!requireAdmin())return;state.extraDreams=(state.extraDreams||[]).filter(x=>x.id!==id);persist('Removed');renderDreams()}
 function renderDreams(){
   const rec=document.getElementById('dreamsRecommended');
   const custom=document.getElementById('dreamsCustomList');
@@ -1810,13 +2152,13 @@ function renderDreams(){
       <div style="font-size:36px">${escapeHtml(d.emoji||'🌙')}</div>
       <h3 style="margin:8px 0 6px">${escapeHtml(d.title)}</h3>
       <p style="font-size:14px;color:#555;margin:0">${escapeHtml(d.desc||'')}</p>
-      ${adminUnlocked?`<button class="save" style="background:#8b8aa3;margin-top:10px;padding:8px 12px;font-size:12px" onclick="deleteDreamItem('${d.id}')">Remove</button>`:''}
+      ${adminUnlocked?`<button class="save" style="background:#8b8aa3;margin-top:10px;padding:8px 12px;font-size:12px" data-action="del-dream" data-id="${escapeHtml(d.id)}">Remove</button>`:''}
     </div>`).join('')||'<div class="panel" style="text-align:center;color:#888">No extra dreams yet. Parents can add more from Parent Admin.</div>';
   }
   if(admin){
     admin.innerHTML=(state.extraDreams||[]).map(d=>`<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid #eee">
       <span style="font-size:13px">${escapeHtml(d.emoji||'')} ${escapeHtml(d.title)}</span>
-      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" onclick="deleteDreamItem('${d.id}')">✕</button>
+      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" data-action="del-dream" data-id="${escapeHtml(d.id)}">✕</button>
     </div>`).join('')||'<small style="color:#888">None yet</small>';
   }
 }
@@ -1831,9 +2173,10 @@ function addDevLink(){
   state.devLinks=state.devLinks.slice(0,30);
   const t=document.getElementById('devTitleInput');if(t)t.value='';
   const u=document.getElementById('devUrlInput');if(u)u.value='';
-  save();renderDevLinks();toast('🚀 Development link added!');
+  persist('🚀 Development link added!');
+  renderDevLinks();
 }
-function deleteDevLink(id){if(!requireAdmin())return;state.devLinks=(state.devLinks||[]).filter(x=>x.id!==id);save();renderDevLinks();toast('Removed')}
+function deleteDevLink(id){if(!requireAdmin())return;state.devLinks=(state.devLinks||[]).filter(x=>x.id!==id);persist('Removed');renderDevLinks()}
 function renderDevLinks(){
   const box=document.getElementById('developmentPageList');
   const note=document.getElementById('devEmptyNote');
@@ -1844,14 +2187,14 @@ function renderDevLinks(){
       <div style="font-size:36px">🚀</div>
       <h3 style="margin:8px 0">${escapeHtml(x.title)}</h3>
       <a class="save" href="${escapeHtml(x.url)}" target="_blank" rel="noopener">Open Project ↗</a>
-      ${adminUnlocked?`<button class="save" style="background:#8b8aa3;margin-top:8px;padding:8px 12px;font-size:12px" onclick="deleteDevLink('${x.id}')">Remove</button>`:''}
+      ${adminUnlocked?`<button class="save" style="background:#8b8aa3;margin-top:8px;padding:8px 12px;font-size:12px" data-action="del-dev" data-id="${escapeHtml(x.id)}">Remove</button>`:''}
     </div>`).join('');
   }
   if(note)note.style.display=list.length?'none':'block';
   if(admin){
     admin.innerHTML=list.map(x=>`<div style="display:flex;justify-content:space-between;gap:8px;padding:6px 0;border-bottom:1px solid #eee">
       <span style="font-size:13px">${escapeHtml(x.title)}</span>
-      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" onclick="deleteDevLink('${x.id}')">✕</button>
+      <button class="save" style="background:#8b8aa3;padding:6px 10px;font-size:12px" data-action="del-dev" data-id="${escapeHtml(x.id)}">✕</button>
     </div>`).join('')||'<small style="color:#888">None yet</small>';
   }
 }
@@ -1880,7 +2223,7 @@ async function saveBgImage(){
   if(f.size>3*1024*1024){toast('Please use an image under 3 MB');return;}
   try{
     // Aggressive compress for backgrounds: max ~1200px; WebP when available
-    state.bgImage=await compressImage(f,'background');
+    state.bgImage=toRef(await compressImage(f,'background'));
     state.bgTheme='image';
     applyBgTheme();
     const ok=save();
@@ -1904,7 +2247,7 @@ function applyBgTheme(){
   const prev=document.getElementById('bgImagePreview');
   const wrap=document.getElementById('bgImagePreviewWrap');
   if(state.bgImage){
-    if(prev){prev.src=state.bgImage;if(wrap)wrap.style.display='block';}
+    if(prev){resolveMedia(state.bgImage).then(d=>{if(d){prev.src=d;if(wrap)wrap.style.display='block'}})}
   }else{
     if(prev)prev.removeAttribute('src');
     if(wrap)wrap.style.display='none';
@@ -1916,7 +2259,8 @@ function applyBgTheme(){
   document.body.style.backgroundAttachment='';
 
   if(t==='image'&&state.bgImage&&layer){
-    layer.style.backgroundImage=`url(${state.bgImage})`;
+    layer.style.backgroundImage='none';
+    resolveMedia(state.bgImage).then(d=>{if(d)layer.style.backgroundImage='url('+d+')'});
     layer.classList.add('has-image');
     document.body.classList.add('bg-image-active');
     document.body.style.backgroundColor='transparent';
@@ -1937,14 +2281,12 @@ function renderLovePic(){
   const preview=document.getElementById('lovePicPreview');
   const previewEmpty=document.getElementById('lovePicPreviewEmpty');
   if(img){
-    if(state.lovePic){img.src=state.lovePic;img.style.display='block';}
+    if(state.lovePic){resolveMedia(state.lovePic).then(d=>{if(d){img.src=d;img.style.display='block'}})}
     else{img.removeAttribute('src');img.style.display='none';}
   }
   if(preview&&previewEmpty){
     if(state.lovePic){
-      preview.src=state.lovePic;
-      preview.style.display='block';
-      previewEmpty.style.display='none';
+      resolveMedia(state.lovePic).then(d=>{if(!d)return;preview.src=d;preview.style.display='block';previewEmpty.style.display='none'});
     }else{
       preview.removeAttribute('src');
       preview.style.display='none';
@@ -1963,7 +2305,7 @@ async function saveLovePic(){
   const f=document.getElementById('lovePicInput')?.files?.[0];
   if(!f){toast('Choose a photo first 📸');return;}
   try{
-    state.lovePic=await compressImage(f,'thumb');
+    state.lovePic=toRef(await compressImage(f,'thumb'));
     const ok=save();
     renderLovePic();
     if(ok)toast('💖 Love photo saved! It will show on the Home page.');
@@ -2029,11 +2371,11 @@ function saveCreation(){const n=document.getElementById('planetName').value.trim
 function explore(place,fact){document.getElementById('exploreResult').innerHTML=`<div class="result correct">🌍 <b>${place}:</b> ${fact}</div>`;earn(15,'World Explorer','Explorer World','🌍',6)}
 function moneyChoice(c){document.getElementById('moneyResult').innerHTML=c==='save'?'<div class="result correct">🐷 Great plan! Saving, spending and giving are all useful parts of money planning.</div>':'<div class="result wrong">That can be fun, but planning some saving first can help you reach a bigger goal.</div>';if(c==='save')earn(20,'Money Mission','Money Mansion','💰',7)}
 function superMission(c){const m={kind:'You made kindness your superpower!',brave:'Being brave means trying even when something feels new.',help:'Helping others is a real-life superpower.',gratitude:'Gratitude helps us notice the good things around us.'};document.getElementById('superResult').innerHTML=`<div class="result correct">❤️ ${m[c]} +20 XP</div>`;earn(20,'Super Me Mission','Super Me','❤️',5)}
-function saveName(){if(!requireAdmin())return;const n=document.getElementById('nameInput').value.trim();if(n){state.name=n;save();toast('Name updated! 💖')}}
+function saveName(){if(!requireAdmin())return;const n=document.getElementById('nameInput').value.trim();if(n){const old=state.name;state.name=n;persistWithRollback('name',old,'Name updated! 💖')}}
 function birthdayMode(){document.getElementById('birthdayModal').classList.add('show');document.getElementById('birthdayMissions').innerHTML=state.birthday.map((done,i)=>`<div class="mission"><b>Mission ${i+1}</b> — ${['Say 3 things you love about yourself','Solve a birthday riddle','Draw your dream cake','Do a secret kindness','Name 5 things you want to learn','Tell a family member a happy memory','Take your Birthday Hero oath'][i]} ${done?'✅':'<button class="save" style="float:right" onclick="birthdayMission('+i+')">Complete</button>'}</div>`).join('')+`<p style="text-align:center;font-weight:900">${state.birthday.filter(Boolean).length}/7 missions complete</p>`}
 function closeBirthday(){document.getElementById('birthdayModal').classList.remove('show')}
-function birthdayMission(i){if(!state.birthday[i]){state.birthday[i]=true;state.xp+=25;if(state.birthday.every(Boolean)){state.badges.push(8);toast('🎂 Birthday Hero badge unlocked!')}save();birthdayMode()}}
-function init(){adminUnlocked=false;document.body.classList.remove('admin-auth');const pb=document.getElementById('parentNavBtn');if(pb)pb.style.display='none';render();initMath();renderHomeVideo();document.getElementById('popupChatAvatar').src=state.photo||'';document.getElementById('storyText').innerHTML=`Tonight, <b>${escapeHtml(state.name)}</b> notices a tiny glowing star outside the window. It whispers: “The Birthday Treasure is hidden somewhere in the Learning Universe!” ⭐`;document.getElementById('nameInput').value=state.name;chatWelcome(false);const ci=document.getElementById('chatInput');if(ci)ci.addEventListener('keydown',e=>{if(e.key==='Enter')sendChat()});const pi=document.getElementById('popupChatInput');if(pi)pi.addEventListener('keydown',e=>{if(e.key==='Enter')sendPopupChat()});const launcher=document.getElementById('stuviChatLauncher');if(launcher)launcher.style.display='block';}
+function birthdayMission(i){if(!state.birthday[i]){state.birthday[i]=true;state.xp+=25;if(state.birthday.every(Boolean)){state.badges.push(8);toast('🎂 Birthday Hero badge unlocked!')}persist();birthdayMode()}}
+function init(){let wasUnlocked=false;try{wasUnlocked=sessionStorage.getItem(ADMIN_SESSION_KEY)==='1'}catch(e){}setAdminUnlocked(wasUnlocked);bindAllActions();render();initMath();renderHomeVideo();document.getElementById('popupChatAvatar').src=state.photo||'';document.getElementById('storyText').innerHTML=`Tonight, <b>${escapeHtml(state.name)}</b> notices a tiny glowing star outside the window. It whispers: “The Birthday Treasure is hidden somewhere in the Learning Universe!” ⭐`;document.getElementById('nameInput').value=state.name;chatWelcome(false);const ci=document.getElementById('chatInput');if(ci)ci.addEventListener('keydown',e=>{if(e.key==='Enter')sendChat()});const pi=document.getElementById('popupChatInput');if(pi)pi.addEventListener('keydown',e=>{if(e.key==='Enter')sendPopupChat()});const launcher=document.getElementById('stuviChatLauncher');if(launcher)launcher.style.display='block';}
 document.addEventListener('keydown',e=>{if(e.ctrlKey&&e.shiftKey&&e.key.toLowerCase()==='p'){e.preventDefault();openParentLogin()}});
 init();
 
@@ -2070,7 +2412,8 @@ function voteCareer(id){
   state.careerVotes=state.careerVotes||{};
   state.careerVotes[id]=(state.careerVotes[id]||0)+1;
   voted[id]=true; localStorage.setItem('stuviCareerVoted',JSON.stringify(voted));
-  save(); renderCareerCommunity(); toast('🗳️ Your vote was counted!');
+  if(save()){renderCareerCommunity();toast('🗳️ Your vote was counted!')}
+  else{state.careerVotes[id]=Math.max(0,(state.careerVotes[id]||1)-1);delete voted[id];try{localStorage.setItem('stuviCareerVoted',JSON.stringify(voted))}catch(e){}}
 }
 function suggestCareer(){
   const input=document.getElementById('careerSuggestInput');
@@ -2083,7 +2426,7 @@ function suggestCareer(){
   state.careerSuggestions.unshift({id:uid('suggest'),title,category:cat?.value||'other',votes:0});
   state.careerSuggestions=state.careerSuggestions.slice(0,50);
   if(input)input.value='';
-  save(); renderCareerCommunity(); toast('💡 Career suggestion added!');
+  if(save()){renderCareerCommunity();toast('💡 Career suggestion added!')}else{state.careerSuggestions.shift()}
 }
 function careerCard(c){
   const votes=Number((state.careerVotes||{})[c.id]||0);
